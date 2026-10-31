@@ -14,7 +14,7 @@
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 APP_DIR="/etc/mieru-lite"
 CONFIG_JSON="${APP_DIR}/server.json"
 METADATA_FILE="${APP_DIR}/metadata.json"
@@ -120,7 +120,7 @@ _resolve_node_ip() {
     v6)
       v6=$(_get_ip6)
       if [ -n "$v6" ]; then printf '%s' "$v6"; return; fi
-      _warn "该节点指定 IPv6，但未探测到可用 IPv6，已回退 IPv4。" >&2
+      _warn "服务端指定了 IPv6，但未探测到可用 IPv6，已回退 IPv4。" >&2
       _get_ip4
       ;;
     *)
@@ -153,7 +153,7 @@ _ask_ip_ver() {
       *) _warn "输入 '${iv}' 无法识别，按 IPv4 处理。"; IP_VER="v4" ;;
     esac
   elif [ -n "$v6" ]; then
-    IP_VER="v6"; _info "检测到仅 IPv6，节点使用 IPv6 地址。"
+    IP_VER="v6"; _info "检测到仅 IPv6，服务端使用 IPv6 地址。"
   else
     IP_VER="v4"
   fi
@@ -182,7 +182,7 @@ _detect_init_system() {
   fi
 }
 
-# 默认节点名: 国家-运营商（ip-api.com 单次请求，缓存 24h）
+# 默认 mihomo 节点前缀: 国家-运营商（ip-api.com 单次请求，缓存 24h）
 _geo_name() {
   local cc="" isp="" ts now raw
   now=$(date +%s)
@@ -485,22 +485,22 @@ _probe_ports() {
   printf '%s' "$out"
 }
 
-# ---------------- 节点（用户） ----------------
+# ---------------- 用户 ----------------
 # 交互入口: 端口还没定的话先问端口, 再建用户
-_add_node() {
+_add_user() {
   _init_metadata || return 1
   local ports
   ports=$(_probe_ports)
   if [ -z "$ports" ]; then
-    echo "服务端还没有监听端口，先定一个（所有用户共用，单端口或端口段都行）。"
+    echo "服务端还没有监听端口（节点还没定），先定一个 —— 所有用户共用，单端口或端口段都行。"
     _ask_ip_ver
     _modify_ports_from_add || return 1
   fi
-  _node_create
+  _user_create
 }
 
 # 纯执行层: 不提任何问题, 交互菜单和 CLI 快捷命令共用
-_node_create() {
+_user_create() {
   _init_metadata || return 1
   if [ -z "$(_probe_ports)" ]; then
     _error "还没有监听端口，请先设置端口（菜单 3 或 mr setport）。"
@@ -528,7 +528,7 @@ _node_create() {
   fi
   sleep 1
   if _service_active; then
-    _success "节点已添加并已生效。"
+    _success "用户已添加并已生效。"
   else
     _warn "服务未处于运行状态，请查看菜单 8 日志。"
   fi
@@ -540,18 +540,18 @@ _delete_user_silent() {
   jq --arg n "$1" 'del(.users[] | select(.name == $n))' "$METADATA_FILE" > "$tmp" && mv -f "$tmp" "$METADATA_FILE"
 }
 
-_delete_node_menu() {
+_delete_user_menu() {
   _init_metadata || return 1
   local n; n=$(jq '.users | length' "$METADATA_FILE")
-  if [ "$n" -eq 0 ]; then _warn "当前没有节点。"; return; fi
-  echo "现有节点:"
-  jq -r '.users | to_entries[] | "  \(.key + 1)) \(.name)"' "$METADATA_FILE"
+  if [ "$n" -eq 0 ]; then _warn "当前没有用户。"; return; fi
+  echo "现有用户:"
+  jq -r '.users | to_entries[] | "  \(.key + 1)) \(.value.name)"' "$METADATA_FILE"
   local idx name
   read -rp "要删除第几个? [0 取消]: " idx || idx=""
   idx=$(_clean_input "$idx")
   [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "$n" ] || { _warn "已取消。"; return; }
   name=$(jq -r --argjson i $((idx - 1)) '.users[$i].name' "$METADATA_FILE")
-  read -rp "确认删除节点 ${name} ? [y/N]: " c || c=""
+  read -rp "确认删除用户 ${name} ? [y/N]: " c || c=""
   [[ "$c" =~ ^[Yy]$ ]] || { _warn "已取消。"; return; }
   _delete_user_silent "$name"
   _apply_config && { _restart_service; _success "已删除 ${name}。"; }
@@ -613,7 +613,7 @@ _modify_ports_menu() {
   _apply_config || return 1
   _restart_service
   if ! _has_users; then
-    _info "端口已切到 ${p}，添加节点后开始监听。"
+    _info "端口已切到 ${p}，添加用户后开始监听。"
   elif _wait_spec_listen "$p"; then
     _success "端口已切换到 ${p}，监听正常。"
   else
@@ -647,7 +647,7 @@ _show_user_link() {
   ip=$(_resolve_node_ip "$ver")
   if [ -z "$ip" ]; then _error "无法探测本机公网 IP，链接未生成。"; return 1; fi
   echo ""
-  echo -e "${GREEN}节点: ${uname}${NC}"
+  echo -e "${GREEN}用户: ${uname}${NC}"
   echo "地址: $(_link_host "$ip")   端口: $(_probe_ports)"
   echo "复用: $(_meta_get '.multiplexing')   MTU: $(_meta_get '.mtu')"
   echo ""
@@ -709,7 +709,7 @@ _show_links() {
   ver=$(_meta_get '.ip_ver'); [ -z "$ver" ] && ver="v4"
   ip=$(_resolve_node_ip "$ver")
   n=$(jq '.users | length' "$METADATA_FILE")
-  if [ "$n" -eq 0 ]; then _warn "还没有节点，请先【1 添加节点】。"; return; fi
+  if [ "$n" -eq 0 ]; then _warn "还没有用户，请先【1 添加用户】。"; return; fi
   if [ -z "$ip" ]; then _error "无法探测公网 IP，请检查网络。"; return; fi
   _info "监听: $(_probe_ports)   对外地址: $(_link_host "$ip")   MTU: $(_meta_get '.mtu')"
   echo ""
@@ -742,7 +742,7 @@ _menu_status() {
   _service_active && _success "mieru 服务运行中" || _warn "mieru 服务未运行"
   if [ -s "$METADATA_FILE" ]; then
     echo "监听: $(_probe_ports || echo 未配置)   MTU: $(_meta_get '.mtu')   复用: $(_meta_get '.multiplexing')"
-    echo "节点数量: $(jq '.users | length' "$METADATA_FILE" 2>/dev/null)"
+    echo "用户数量: $(jq '.users | length' "$METADATA_FILE" 2>/dev/null)"
   fi
   if [ -x "$MITA_BIN" ] && _service_active; then
     local st; st=$("$MITA_BIN" status 2>/dev/null)
@@ -755,7 +755,7 @@ _show_conns() {
   _info "当前连接:"
   "$MITA_BIN" get connections 2>/dev/null | head -n 30 || _warn "取连接信息失败。"
   echo ""
-  _info "用户流量:"
+  _info "用户列表:"
   "$MITA_BIN" get users 2>/dev/null | head -n 30 || true
 }
 
@@ -963,7 +963,7 @@ _set_hop_cli() {
   _apply_config || return 1
   _restart_service
   if ! _has_users; then
-    _info "端口段已写入，添加节点后开始监听（mita 无用户时不启监听）。"
+    _info "端口段已写入，添加用户后开始监听（mita 无用户时不启监听）。"
     return 0
   fi
   local i tcpc=0 udpc=0
@@ -1007,15 +1007,15 @@ _menu_set_hop() {
 _show_menu() {
   echo ""
   echo -e "${GREEN}======== mieru-lite 管理脚本 v${SCRIPT_VERSION} ========${NC}"
-  echo " 1. 添加节点（用户 + 端口 / 端口段）"
-  echo " 2. 查看节点链接（mieru / mihomo）"
+  echo " 1. 添加用户（共用服务端节点，每人一条链接）"
+  echo " 2. 查看用户链接（mieru / mihomo）"
   echo " 3. 修改监听端口（或端口段）/ MTU / 多路复用 / IP 版本"
-  echo " 4. 删除节点"
+  echo " 4. 删除用户"
   echo " 5. 重启服务"
   echo " 6. 停止服务"
   echo " 7. 查看运行状态"
   echo " 8. 查看实时日志"
-  echo " 9. 查看当前连接与用户流量"
+  echo " 9. 查看当前连接与用户列表"
   echo "10. 开启 BBR"
   echo "11. 安装 / 更新 mita 内核"
   echo "12. 更新脚本 (mr)"
@@ -1038,14 +1038,14 @@ _main_menu() {
           if [[ ! "$ic" =~ ^[Nn]$ ]]; then
             install_core || { _error "内核安装失败，请检查网络。"; continue; }
           else
-            _warn "未安装内核，添加的节点无法运行。"
+            _warn "未安装内核，添加的用户无法运行。"
           fi
         fi
-        _add_node
+        _add_user
         ;;
       2) _show_links ;;
       3) _modify_ports_menu ;;
-      4) _delete_node_menu ;;
+      4) _delete_user_menu ;;
       5)
         _restart_service
         local p; p=$(jq -r '.ports[0].port // empty' "$METADATA_FILE" 2>/dev/null)
@@ -1085,7 +1085,7 @@ _set_port_cli() {  # $1=端口（或端口段） $2=tcp|udp|both
   _apply_config || return 1
   _restart_service
   if ! _has_users; then
-    _info "端口 ${p} 已写入，添加节点后开始监听（mita 无用户时不会启监听）。"
+    _info "端口 ${p} 已写入，添加用户后开始监听（mita 无用户时不会启监听）。"
   elif _wait_spec_listen "$p"; then
     _success "端口 ${p} 监听正常。"
   else
@@ -1109,7 +1109,7 @@ case "${1:-}" in
   links)   _check_root; _install_dependencies >/dev/null 2>&1; _init_metadata; _show_links; exit 0 ;;
   status)  _check_root; _init_metadata; _detect_init_system; _menu_status; exit 0 ;;
   install) _check_root; _install_dependencies || exit 1; _detect_init_system; _init_metadata; install_core; exit 0 ;;
-  adduser) _check_root; _init_metadata; _detect_init_system; _node_create; exit 0 ;;
+  adduser) _check_root; _init_metadata; _detect_init_system; _user_create; exit 0 ;;
   setport) _check_root; _init_metadata; _detect_init_system; _set_port_cli "${2:-}" "${3:-tcp}"; exit 0 ;;
   hop)     _check_root; _init_metadata; _detect_init_system; _set_hop_cli "${2:-}" "${3:-tcp}"; exit 0 ;;
   version) echo "mieru-lite v${SCRIPT_VERSION}"; exit 0 ;;
