@@ -14,7 +14,7 @@
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.2.0"
 APP_DIR="/etc/mieru-lite"
 CONFIG_JSON="${APP_DIR}/server.json"
 METADATA_FILE="${APP_DIR}/metadata.json"
@@ -22,6 +22,8 @@ SUB_DIR="${APP_DIR}/sub"
 RUNTIME_DIR="/run/mieru-lite"
 UDS_PATH="${RUNTIME_DIR}/mita.sock"
 MITA_BIN="/usr/local/bin/mita"
+# 端口跳跃: 服务端要为段内每个端口各开一个监听, 实测约 11-14KB 内存/端口, fd 也是一口一个
+MAX_HOP_PORTS="${MAX_HOP_PORTS:-2000}"
 SERVICE_NAME="mieru-lite"
 CORE_LOG="/var/log/mieru-core.log"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/guanxi660-crypto/mieru-lite/main/mieru-lite.sh"
@@ -205,7 +207,21 @@ _geo_name() {
          '.geo = {cc:$cc, isp:$isp, ts:$ts}' "$METADATA_FILE" > "$tmp" && mv -f "$tmp" "$METADATA_FILE"
     fi
   fi
-  printf '%s-%s' "$cc" "$(printf '%s' "$isp" | tr ' ' '_' | tr -cd 'A-Za-z0-9_.-')"
+  [ -z "$cc" ] && cc="XX"
+  if [ -z "$isp" ]; then
+    isp="ISP"
+  else
+    isp="${isp%%(*}"                                                   # 砍掉括号补充说明
+    isp="${isp%% *}"                                                   # 空格后截断: 只保留第一个词
+    isp=$(printf '%s' "$isp" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    # 按字符(非字节)截断到 16，避免把中文运营商名切半产生非法 UTF-8
+    local cut
+    cut=$(printf '%s' "$isp" | jq -Rr '.[0:16]' 2>/dev/null)
+    [ -n "$cut" ] && isp="$cut"
+    [ -z "$isp" ] && isp="ISP"
+  fi
+  # 节点名: CC.ISP.Mieru（传输层由 _build_clash_yaml 按 .TCP/.UDP 追加）
+  printf '%s.%s.Mieru' "$cc" "$isp"
 }
 
 # ---------------- 网络下载 ----------------
@@ -402,9 +418,20 @@ _port_in_use() {
 }
 
 # 这个端口是不是本项目自己正在用的（切换协议/改配置时不能把自己判成"被占用"）
+# 注意: 端口跳跃时配置里存的是 portRange，端口号只是落在段内，也必须算"自己的"
 _port_owned_by_us() {
+  local p="$1" a b
   [ -s "$METADATA_FILE" ] || return 1
-  jq -r '.ports[]?.port' "$METADATA_FILE" 2>/dev/null | grep -qx "$1"
+  if jq -r '.ports[]? | (.port // empty)' "$METADATA_FILE" 2>/dev/null | grep -qx "$p"; then
+    return 0
+  fi
+  while IFS='-' read -r a b; do
+    [ -z "$b" ] && continue
+    if [ "$p" -ge "$a" ] 2>/dev/null && [ "$p" -le "$b" ] 2>/dev/null; then
+      return 0
+    fi
+  done < <(jq -r '.ports[]? | (.portRange // empty)' "$METADATA_FILE" 2>/dev/null)
+  return 1
 }
 
 # 没有用户时 mita 不会启动监听（配置校验不过），此时不该判"端口没起来"为失败
@@ -454,7 +481,7 @@ _apply_config() {
 # 端口/MTU 变化必须重启进程; 仅用户变化 reload 就够, 但重启更可预期
 _probe_ports() {
   local out="" p proto
-  out=$(jq -r '.ports[] | "\(.port)/\(.protocol)"' "$METADATA_FILE" 2>/dev/null | paste -sd, -)
+  out=$(jq -r '.ports[] | "\(.port // .portRange)/\(.protocol)"' "$METADATA_FILE" 2>/dev/null | paste -sd, -)
   printf '%s' "$out"
 }
 
@@ -465,7 +492,7 @@ _add_node() {
   local ports
   ports=$(_probe_ports)
   if [ -z "$ports" ]; then
-    echo "服务端还没有监听端口，先定一个（所有用户共用）。"
+    echo "服务端还没有监听端口，先定一个（所有用户共用，单端口或端口段都行）。"
     _ask_ip_ver
     _modify_ports_from_add || return 1
   fi
@@ -532,31 +559,24 @@ _delete_node_menu() {
 
 # ---------------- 端口 / 参数 ----------------
 _modify_ports_from_add() {
-  local p proto_choice p_in
+  local p proto_choice p_in proto ports desc
   p=$(_pick_port)
   echo "监听协议: 1) 仅 TCP（最稳，推荐）  2) TCP + UDP（同号，UDP 更抗丢包）"
   read -rp "选择 [1]: " proto_choice || proto_choice=""
   proto_choice=$(_clean_input "$proto_choice")
+  case "$proto_choice" in
+    2|u|U|udp|UDP) proto="both"; desc="TCP + UDP 同号" ;;
+    *)             proto="tcp";  desc="仅 TCP" ;;
+  esac
+  echo "端口填单个数字（如 25443），或填一段范围（如 30000-30999，客户端每条连接随机挑）——两者只能选一种。"
   read -rp "监听端口 [${p}]: " p_in || p_in=""
   p_in=$(_clean_input "$p_in")
   [ -n "$p_in" ] && p="$p_in"
-  if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1025 ] || [ "$p" -gt 65535 ]; then
-    _error "端口非法: ${p}（需 1025-65535）"; return 1
-  fi
-  if ! _port_owned_by_us "$p"; then
-    _port_in_use "$p" && { _error "端口 ${p} 已被其它程序占用。"; return 1; }
-  fi
-  case "$proto_choice" in
-    2|u|U|udp|UDP)
-      _meta_set_ports "[{\"port\":${p},\"protocol\":\"TCP\"},{\"port\":${p},\"protocol\":\"UDP\"}]"
-      _info "监听端口: ${p}（TCP + UDP 同号）"
-      ;;
-    *)
-      _meta_set_ports "[{\"port\":${p},\"protocol\":\"TCP\"}]"
-      _info "监听端口: ${p}（仅 TCP）"
-      ;;
-  esac
+  _check_spec_free "$p" || return 1
+  ports=$(_port_spec_to_ports "$p" "$proto") || return 1
+  _meta_set_ports "$ports"
   PENDING_PORT="$p"
+  _info "监听: ${p}（${desc}）"
   return 0
 }
 
@@ -594,7 +614,7 @@ _modify_ports_menu() {
   _restart_service
   if ! _has_users; then
     _info "端口已切到 ${p}，添加节点后开始监听。"
-  elif _wait_listen "$p"; then
+  elif _wait_spec_listen "$p"; then
     _success "端口已切换到 ${p}，监听正常。"
   else
     _warn "端口 ${p} 30 秒内未监听，请看菜单 8 日志。"
@@ -616,7 +636,7 @@ _build_user_link() {
   while IFS='/' read -r port proto; do
     [ -z "$port" ] && continue
     qs="${qs}&port=${port}&protocol=${proto}"
-  done < <(jq -r '.ports[] | "\(.port)/\(.protocol)"' "$METADATA_FILE")
+  done < <(jq -r '.ports[] | "\(.port // .portRange)/\(.protocol)"' "$METADATA_FILE")
   qs="${qs}&mtu=$(_meta_get '.mtu')&multiplexing=$(_meta_get '.multiplexing')&handshake-mode=HANDSHAKE_STANDARD"
   printf 'mierus://%s:%s@%s?%s' "$(_url_encode "$uname")" "$(_url_encode "$pass")" "$host" "$qs"
 }
@@ -645,28 +665,38 @@ _build_clash_yaml() {
   [ -z "$ip" ] && ip=$(_resolve_node_ip "$ver")
   # YAML 里绝不能给 IPv6 加方括号 —— `server: [2602:...]` 会被解析成数组
   local geo; geo=$(_geo_name)
+  local -a tags=()
+  local uidx=0
   echo "proxies:"
   while IFS= read -r row; do
-    local uname pass
+    local uname pass usuf=""
     uname=$(printf '%s' "$row" | cut -d'|' -f1)
     pass=$(printf '%s' "$row" | cut -d'|' -f2)
-    while IFS='/' read -r port proto; do
-      [ -z "$port" ] && continue
-      local tag="${geo}-${uname}-${proto}${port}"
+    # 多用户时第 2 个起加 .2/.3 后缀，否则 mihomo 里会重名
+    [ "$uidx" -gt 0 ] && usuf=".$((uidx + 1))"
+    while IFS='|' read -r spec proto; do
+      [ -z "$spec" ] && continue
+      local tag="${geo}.${proto}${usuf}"
+      tags+=("$tag")
       echo "  - name: \"${tag}\""
       echo "    type: mieru"
       echo "    server: \"${ip}\""
-      echo "    port: ${port}"
-      echo "    transport: ${proto}"
-      echo "    udp: true"
+      if [[ "$spec" == *-* ]]; then
+        echo "    port-range: \"${spec}\""
+      else
+        echo "    port: ${spec}"
+      fi
       echo "    username: \"${uname}\""
       echo "    password: \"${pass}\""
+      echo "    transport: ${proto}"
+      echo "    udp: true"
       echo "    multiplexing: $(_meta_get '.multiplexing')"
       echo "    handshake-mode: HANDSHAKE_STANDARD"
-    done < <(jq -r '.ports[] | "\(.port)/\(.protocol)"' "$METADATA_FILE")
+    done < <(jq -r '.ports[] | "\(.port // .portRange)|\(.protocol)"' "$METADATA_FILE")
+    uidx=$((uidx + 1))
   done < <(jq -r '.users[] | "\(.name)|\(.password)"' "$METADATA_FILE")
   local names
-  names=$(jq -r --arg geo "$geo" '.users[].name as $u | .ports[] | "\($geo)-\($u)-\(.protocol)\(.port)"' "$METADATA_FILE" | paste -sd, - | sed 's/,/, /g')
+  names=$(printf '%s\n' "${tags[@]}" | paste -sd, - | sed 's/,/, /g')
   echo "proxy-groups:"
   echo "  - name: \"PROXY\""
   echo "    type: select"
@@ -810,13 +840,176 @@ _uninstall() {
   exit 0
 }
 
+# ---------------- 端口跳跃 ----------------
+# 服务端在整段端口上监听 (mita 原生 portRange, 段内每个口各一个 socket);
+# 客户端 (mihomo / mieru 官方客户端) 每条连接随机挑一个口 —— 见 pkg/protocol/mux.go newUnderlay()
+
+_count_listen_in_range() {  # $1=起始 $2=结束 $3=TCP|UDP
+  local a="$1" b="$2" proto="${3:-TCP}"
+  if [ "$proto" = "UDP" ]; then ss -lnu 2>/dev/null; else ss -tln 2>/dev/null; fi \
+    | awk -v a="$a" -v b="$b" '{n=$4; sub(/.*:/, "", n); if (n+0>=a && n+0<=b) c++} END{print c+0}'
+}
+
+# 校验端口段, 结果放 HOP_A / HOP_B / HOP_N
+_hop_range_valid() {
+  local r="$1" a b n
+  if ! [[ "$r" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+    _error "格式错误: ${r}（应为 起-止，例如 30000-30999）"; return 1
+  fi
+  a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+  if [ "$a" -lt 1025 ] || [ "$b" -gt 65535 ]; then _error "端口需在 1025-65535 之间。"; return 1; fi
+  if [ "$a" -ge "$b" ]; then _error "起始端口必须小于结束端口（至少 2 个）。"; return 1; fi
+  n=$((b - a + 1))
+  if [ "$n" -gt "$MAX_HOP_PORTS" ]; then
+    _error "范围 ${n} 个端口，超过上限 ${MAX_HOP_PORTS}。"
+    _warn "mita 要给段内每个端口各开一个监听，实测约 12KB 内存/端口、fd 一对一，${n} 个约 $((n * 12 / 1024))MB。"
+    _info "确实要这么大就用 MAX_HOP_PORTS=${n} 重新执行。"
+    return 1
+  fi
+  HOP_A="$a"; HOP_B="$b"; HOP_N="$n"
+  return 0
+}
+
+# ---------------- 端口规格（单端口 / 端口段，二选一） ----------------
+# 一个节点只能用一种形态：写了 port 就不能有 port-range（mihomo 会直接报
+# "port and port-range cannot be set at the same time"），反过来也一样。
+# 所以 ports 数组一律从这里生成，绝不在同一份 metadata 里混写两种。
+
+# $1 = 25443 或 30000-30999   $2 = tcp | udp | both
+# 校验通过后打印 metadata.ports 的 JSON 数组
+_port_spec_to_ports() {
+  local spec="$1" proto="${2:-tcp}" a b
+  if [[ "$spec" == *-* ]]; then
+    _hop_range_valid "$spec" || return 1
+    a=$HOP_A; b=$HOP_B
+    case "$proto" in
+      udp|tcp+udp|both) printf '[{"portRange":"%s-%s","protocol":"TCP"},{"portRange":"%s-%s","protocol":"UDP"}]' "$a" "$b" "$a" "$b" ;;
+      *)                printf '[{"portRange":"%s-%s","protocol":"TCP"}]' "$a" "$b" ;;
+    esac
+    return 0
+  fi
+  if ! [[ "$spec" =~ ^[0-9]{1,5}$ ]]; then
+    _error "格式错误: ${spec}（写单个端口 25443，或一段 30000-30999）"; return 1
+  fi
+  a=$((10#$spec))
+  if [ "$a" -lt 1025 ] || [ "$a" -gt 65535 ]; then
+    _error "端口非法: ${a}（需 1025-65535）"; return 1
+  fi
+  case "$proto" in
+    udp|tcp+udp|both) printf '[{"port":%s,"protocol":"TCP"},{"port":%s,"protocol":"UDP"}]' "$a" "$a" ;;
+    *)                printf '[{"port":%s,"protocol":"TCP"}]' "$a" ;;
+  esac
+}
+
+# 端口规格的占用检查（本项目自己正在用的不算占用；端口段只抽查首尾两个）
+_check_spec_free() {
+  local spec="$1" a b
+  if [[ "$spec" == *-* ]]; then
+    _hop_range_valid "$spec" || return 1
+    a=$HOP_A; b=$HOP_B
+    if ! _port_owned_by_us "$a"; then
+      _port_in_use "$a" && { _error "端口 ${a} 已被其它程序占用。"; return 1; }
+    fi
+    if ! _port_owned_by_us "$b"; then
+      _port_in_use "$b" && { _error "端口 ${b} 已被其它程序占用。"; return 1; }
+    fi
+    return 0
+  fi
+  if ! [[ "$spec" =~ ^[0-9]{1,5}$ ]]; then
+    _error "格式错误: ${spec}（写单个端口 25443，或一段 30000-30999）"; return 1
+  fi
+  a=$((10#$spec))
+  if [ "$a" -lt 1025 ] || [ "$a" -gt 65535 ]; then
+    _error "端口非法: ${a}（需 1025-65535）"; return 1
+  fi
+  if ! _port_owned_by_us "$a"; then
+    _port_in_use "$a" && { _error "端口 ${a} 已被其它程序占用。"; return 1; }
+  fi
+  return 0
+}
+
+# 等监听: 单端口看那个口，端口段看段内监听到的数量
+_wait_spec_listen() {
+  local spec="$1" i n=0
+  if [[ "$spec" != *-* ]]; then
+    _wait_listen "$spec"; return $?
+  fi
+  _hop_range_valid "$spec" || return 1
+  for i in $(seq 1 20); do
+    n=$(_count_listen_in_range "$HOP_A" "$HOP_B" TCP)
+    [ "$n" -ge "$HOP_N" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# 写入端口段并生效: $1=起-止  $2=tcp|udp|both
+_set_hop_cli() {
+  local range="$1" proto="${2:-tcp}" ports desc tcpc udpc
+  _init_metadata || return 1
+  # 传进来是单个端口就交给 setport, 形态永远只有一种
+  case "$range" in
+    *-*) : ;;
+    *) _set_port_cli "$range" "$proto"; return ;;
+  esac
+  _check_spec_free "$range" || return 1
+  ports=$(_port_spec_to_ports "$range" "$proto") || return 1
+  case "$proto" in
+    udp|tcp+udp|both) desc="TCP + UDP 同段" ;;
+    *)                desc="仅 TCP" ;;
+  esac
+  _meta_set_ports "$ports"
+  _info "端口跳跃: ${HOP_A}-${HOP_B}（${HOP_N} 个，${desc}）"
+  _apply_config || return 1
+  _restart_service
+  if ! _has_users; then
+    _info "端口段已写入，添加节点后开始监听（mita 无用户时不启监听）。"
+    return 0
+  fi
+  local i tcpc=0 udpc=0
+  for i in $(seq 1 20); do
+    tcpc=$(_count_listen_in_range "$HOP_A" "$HOP_B" TCP)
+    [ "$tcpc" -ge "$HOP_N" ] && break
+    sleep 1
+  done
+  case "$proto" in
+    udp|tcp+udp|both) udpc=$(_count_listen_in_range "$HOP_A" "$HOP_B" UDP) ;;
+  esac
+  if [ "$tcpc" -ge "$HOP_N" ]; then
+    _success "TCP 段内 ${tcpc}/${HOP_N} 个端口已监听。"
+    case "$proto" in
+      udp|tcp+udp|both) [ "$udpc" -ge "$HOP_N" ] && _success "UDP 段内 ${udpc}/${HOP_N} 个端口已监听。" || _warn "UDP 只监听到 ${udpc}/${HOP_N}，请看菜单 8 日志。" ;;
+    esac
+  else
+    _warn "TCP 只监听到 ${tcpc}/${HOP_N}，可能被 fd 上限卡住，请看菜单 8 日志。"
+  fi
+  _info "记得在防火墙 / 安全组放行 ${HOP_A}-${HOP_B}（TCP 和 UDP 分别放）。"
+  _show_links
+}
+
+_menu_set_hop() {
+  _init_metadata || return 1
+  echo ""
+  echo "端口跳跃：服务端在整段端口上监听，客户端每次连接随机挑一个。"
+  echo "代价：段内每个端口各占一个监听，约 12KB 内存 + 1 个 fd，上限 ${MAX_HOP_PORTS} 个。"
+  echo "建议范围 100-1000 个，例如 30000-30999；只填单个端口请用菜单 3 / mr setport。"
+  local r p
+  read -rp "端口段 [30000-30999]: " r || r=""
+  r=$(_clean_input "$r"); [ -z "$r" ] && r="30000-30999"
+  echo "  1) 仅 TCP（默认）"
+  echo "  2) TCP + UDP 同段"
+  read -rp "传输协议 [1]: " p || p=""
+  p=$(_clean_input "$p")
+  case "$p" in 2|u|U|udp|UDP) _set_hop_cli "$r" both ;; *) _set_hop_cli "$r" tcp ;; esac
+}
+
 # ---------------- 菜单 ----------------
 _show_menu() {
   echo ""
   echo -e "${GREEN}======== mieru-lite 管理脚本 v${SCRIPT_VERSION} ========${NC}"
-  echo " 1. 添加节点（用户，含端口选择）"
+  echo " 1. 添加节点（用户 + 端口 / 端口段）"
   echo " 2. 查看节点链接（mieru / mihomo）"
-  echo " 3. 修改监听端口 / MTU / 多路复用 / IP 版本"
+  echo " 3. 修改监听端口（或端口段）/ MTU / 多路复用 / IP 版本"
   echo " 4. 删除节点"
   echo " 5. 重启服务"
   echo " 6. 停止服务"
@@ -826,7 +1019,8 @@ _show_menu() {
   echo "10. 开启 BBR"
   echo "11. 安装 / 更新 mita 内核"
   echo "12. 更新脚本 (mr)"
-  echo "13. 卸载"
+  echo "13. 端口跳跃（只改端口段，客户端随机挑）"
+  echo "14. 卸载"
   echo " 0. 退出"
 }
 
@@ -864,7 +1058,8 @@ _main_menu() {
       10) _toggle_bbr ;;
       11) install_core ;;
       12) _update_script ;;
-      13) _uninstall ;;
+      13) _menu_set_hop ;;
+      14) _uninstall ;;
       0) exit 0 ;;
       *) _error "无效输入。" ;;
     esac
@@ -872,29 +1067,26 @@ _main_menu() {
 }
 
 # ---------------- 快捷命令（非交互，便于脚本化） ----------------
-_set_port_cli() {
-  local p="$1" proto="${2:-tcp}"
-  if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1025 ] || [ "$p" -gt 65535 ]; then
-    _error "端口非法: ${p}（需 1025-65535）"; return 1
-  fi
-  if ! _port_owned_by_us "$p"; then
-    _port_in_use "$p" && { _error "端口 ${p} 已被其它程序占用。"; return 1; }
-  fi
-  case "$proto" in
-    udp|tcp+udp|both)
-      _meta_set_ports "[{\"port\":${p},\"protocol\":\"TCP\"},{\"port\":${p},\"protocol\":\"UDP\"}]"
-      _info "监听端口: ${p}（TCP + UDP 同号）"
-      ;;
-    *)
-      _meta_set_ports "[{\"port\":${p},\"protocol\":\"TCP\"}]"
-      _info "监听端口: ${p}（仅 TCP）"
-      ;;
+_set_port_cli() {  # $1=端口（或端口段） $2=tcp|udp|both
+  local p="$1" proto="${2:-tcp}" ports desc
+  # 传进来是范围就交给 hop, 形态永远只有一种
+  case "$p" in
+    *-*) _set_hop_cli "$p" "$proto"; return ;;
   esac
+  _init_metadata || return 1
+  _check_spec_free "$p" || return 1
+  ports=$(_port_spec_to_ports "$p" "$proto") || return 1
+  case "$proto" in
+    udp|tcp+udp|both) desc="TCP + UDP 同号" ;;
+    *)                desc="仅 TCP" ;;
+  esac
+  _meta_set_ports "$ports"
+  _info "监听端口: ${p}（${desc}）"
   _apply_config || return 1
   _restart_service
   if ! _has_users; then
     _info "端口 ${p} 已写入，添加节点后开始监听（mita 无用户时不会启监听）。"
-  elif _wait_listen "$p"; then
+  elif _wait_spec_listen "$p"; then
     _success "端口 ${p} 监听正常。"
   else
     _warn "端口 ${p} 未确认监听，请看日志。"
@@ -919,6 +1111,7 @@ case "${1:-}" in
   install) _check_root; _install_dependencies || exit 1; _detect_init_system; _init_metadata; install_core; exit 0 ;;
   adduser) _check_root; _init_metadata; _detect_init_system; _node_create; exit 0 ;;
   setport) _check_root; _init_metadata; _detect_init_system; _set_port_cli "${2:-}" "${3:-tcp}"; exit 0 ;;
+  hop)     _check_root; _init_metadata; _detect_init_system; _set_hop_cli "${2:-}" "${3:-tcp}"; exit 0 ;;
   version) echo "mieru-lite v${SCRIPT_VERSION}"; exit 0 ;;
 esac
 
