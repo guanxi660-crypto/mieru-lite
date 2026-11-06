@@ -14,7 +14,7 @@
 umask 077
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 APP_DIR="/etc/mieru-lite"
 CONFIG_JSON="${APP_DIR}/server.json"
 METADATA_FILE="${APP_DIR}/metadata.json"
@@ -408,6 +408,11 @@ _init_metadata() {
 
 _meta_get() { jq -r "$1" "$METADATA_FILE" 2>/dev/null; }
 
+_meta_set() {  # $1 = jq 表达式, $2 = 值(字符串)
+  local tmp; tmp=$(mktemp)
+  jq --arg v "$2" "$1 = \$v" "$METADATA_FILE" > "$tmp" && mv -f "$tmp" "$METADATA_FILE"
+}
+
 _meta_set_ports() {  # $1 = JSON 数组字符串
   local tmp; tmp=$(mktemp)
   jq --argjson p "$1" '.ports = $p' "$METADATA_FILE" > "$tmp" && mv -f "$tmp" "$METADATA_FILE"
@@ -575,6 +580,8 @@ _modify_ports_from_add() {
   _check_spec_free "$p" || return 1
   ports=$(_port_spec_to_ports "$p" "$proto") || return 1
   _meta_set_ports "$ports"
+  # E1: 首次建用户时选的 v4/v6 必须落盘, 否则链接与配置一直按默认 v4 生成
+  [ -n "${IP_VER:-}" ] && _meta_set '.ip_ver' "$IP_VER"
   PENDING_PORT="$p"
   _info "监听: ${p}（${desc}）"
   return 0
@@ -655,12 +662,12 @@ _show_user_link() {
   _build_user_link "$uname" "$ip"
   echo ""
   echo -e "${CYAN}--- mihomo / Clash Meta 配置 ---${NC}"
-  _build_clash_yaml "$ip" | sed 's/^/  /'
+  _build_clash_yaml "$ip" "$uname" | sed 's/^/  /'
   echo ""
 }
 
-_build_clash_yaml() {
-  local ip="$1" ver
+_build_clash_yaml() {  # $1 = IP, $2 = 只导出该用户(留空=全部)
+  local ip="$1" only="${2:-}" ver
   ver=$(_meta_get '.ip_ver'); [ -z "$ver" ] && ver="v4"
   [ -z "$ip" ] && ip=$(_resolve_node_ip "$ver")
   # YAML 里绝不能给 IPv6 加方括号 —— `server: [2602:...]` 会被解析成数组
@@ -694,7 +701,7 @@ _build_clash_yaml() {
       echo "    handshake-mode: HANDSHAKE_STANDARD"
     done < <(jq -r '.ports[] | "\(.port // .portRange)|\(.protocol)"' "$METADATA_FILE")
     uidx=$((uidx + 1))
-  done < <(jq -r '.users[] | "\(.name)|\(.password)"' "$METADATA_FILE")
+  done < <(jq -r --arg only "$only" '.users[] | select($only == "" or .name == $only) | "\(.name)|\(.password)"' "$METADATA_FILE")
   local names
   names=$(printf '%s\n' "${tags[@]}" | paste -sd, - | sed 's/,/, /g')
   echo "proxy-groups:"
@@ -901,17 +908,28 @@ _port_spec_to_ports() {
   esac
 }
 
-# 端口规格的占用检查（本项目自己正在用的不算占用；端口段只抽查首尾两个）
+# 端口规格的占用检查（本项目自己正在用的不算占用；端口段逐口扫全段, 只看首尾会漏中间）
 _check_spec_free() {
   local spec="$1" a b
   if [[ "$spec" == *-* ]]; then
     _hop_range_valid "$spec" || return 1
     a=$HOP_A; b=$HOP_B
-    if ! _port_owned_by_us "$a"; then
-      _port_in_use "$a" && { _error "端口 ${a} 已被其它程序占用。"; return 1; }
-    fi
-    if ! _port_owned_by_us "$b"; then
-      _port_in_use "$b" && { _error "端口 ${b} 已被其它程序占用。"; return 1; }
+    # E2: 段内任一端口被占, mieru 整段起不来; 只查首尾会漏中间
+    local busy p offenders=""
+    busy=$(ss -lntu 2>/dev/null | awk -v a="$a" -v b="$b" '{
+        q=$5; sub(/.*[:.]/,"",q)
+        if (q !~ /^[0-9]+$/) next
+        v=q+0
+        if (v >= a && v <= b) print v
+      }' | sort -un)
+    for p in $busy; do
+      _port_owned_by_us "$p" && continue
+      offenders="${offenders} ${p}"
+    done
+    if [ -n "$offenders" ]; then
+      _error "端口段 ${a}-${b} 内已被占用:${offenders}"
+      _error "mieru 段内任一端口被占会导致整段监听失败，换个段再试。"
+      return 1
     fi
     return 0
   fi

@@ -1,6 +1,6 @@
 # mieru-lite
 
-> 版本：v1.2.1
+> 版本：v1.2.2
 >
 > **⚠️ 测试阶段（BETA）**：功能与配置格式可能随时调整，请勿用于生产环境。
 
@@ -118,16 +118,17 @@ mr hop 30000-30999 udp    # TCP + UDP 同段
 也就是 **约 11-14KB 内存 + 1 个 fd 一个端口**，因此脚本默认上限 **2000 个**（`MAX_HOP_PORTS=2000`）。
 要更大就 `MAX_HOP_PORTS=5000 mr hop ...`，但记得同时确认 `LimitNOFILE`（脚本的 systemd 单元已经设成 65535）。
 
-### 四个必须知道的点
+### 五个必须知道的点
 
 1. **防火墙/安全组要把整段放行**，TCP 和 UDP 分别放；漏一个口只表现为偶发连不上。
-2. **客户端节点里 `port` 和 `port-range` 只能写一个**。只写 `port-range` 是正确写法，同时写两个 mihomo 会直接报
+2. **段内任何一个端口被占，整段都起不来**（mita 是整段一起 bind，不是跳过那个口）。所以脚本在写入前会**逐口扫全段**，遇到占用直接拒绝并报出冲突端口；切换端口段时本项目自己正在监听的端口不算占用。
+3. **客户端节点里 `port` 和 `port-range` 只能写一个**。只写 `port-range` 是正确写法，同时写两个 mihomo 会直接报
    `port and port-range cannot be set at the same time`（`adapter/outbound/mieru.go` 的 `validateMieruOption` 里两条卡：
    都空报 `either port or port-range must be set`，都写就报上面那条）。脚本的 metadata 只存一种形态，生成的
    配置也就只有一种，样式切换（单端口 ↔ 端口段）时旧字段会被整体覆盖，不会残留。
-3. **`transport` 必填**（`TCP` 或 `UDP`），跟端口形态无关 —— 校验是 `if option.Transport != "TCP" && option.Transport != "UDP"`，
+4. **`transport` 必填**（`TCP` 或 `UDP`），跟端口形态无关 —— 校验是 `if option.Transport != "TCP" && option.Transport != "UDP"`，
    空值一样报错。TCP+UDP 同号时客户端会被拆成两条节点（`xxx.TCP` / `xxx.UDP`），一个 mihomo 节点只能承载一个 transport。
-4. **OpenClash 能用，但要走配置文件**：它的节点编辑界面只收单个数字端口，`port-range` 得通过订阅/自定义
+5. **OpenClash 能用，但要走配置文件**：它的节点编辑界面只收单个数字端口，`port-range` 得通过订阅/自定义
    Clash 配置喂进去。mihomo 自 2024-12-09 支持 mieru 起就带 `port-range` 字段，所以只要内核能跑 `type: mieru`，
    就支持端口跳跃（节点里写 `port-range: "30000-30999"`，不写 `port`）。另外 mihomo 的连接列表里会显示段首端口
    （`NewMieru` 拿 `beginPort` 当展示地址），实际拨号是 mieru 客户端在整段里随机挑，别被那个数字误导。
